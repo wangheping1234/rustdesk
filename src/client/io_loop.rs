@@ -2901,6 +2901,12 @@ impl<T: InvokeUiSession> Remote<T> {
             discard_queue: discard_queue.clone(),
         };
         let handler = self.handler.ui_handler.clone();
+        // How many decoded GPU frames the render path refused back to back. A few
+        // at session start are normal (the texture is registered after the first
+        // frame arrives); a streak means nobody will ever present them, and every
+        // one of those frames already lost its software pixels.
+        #[cfg(all(target_os = "macos", feature = "flutter", feature = "hwcodec"))]
+        let mut gpu_refused_streak = 0usize;
         crate::client::start_video_thread(
             self.handler.clone(),
             display,
@@ -2912,8 +2918,36 @@ impl<T: InvokeUiSession> Remote<T> {
             move |display: usize,
                   data: &mut scrap::ImageRgb,
                   _texture: *mut c_void,
-                  pixelbuffer: bool| {
+                  pixelbuffer: bool,
+                  pixelbuffer_output: scrap::PixelBufferOutput| {
                 *frame_count.write().unwrap() += 1;
+                // A GPU frame is presented as-is; when nobody can take it the
+                // frame is dropped, because the decoder already skipped its
+                // software transfer for it.
+                #[cfg(all(target_os = "macos", feature = "flutter", feature = "hwcodec"))]
+                if let Some(gpu_frame) = &pixelbuffer_output {
+                    if handler.on_pixelbuffer(display, gpu_frame) {
+                        gpu_refused_streak = 0;
+                        return;
+                    }
+                    // Nobody can present it (texture not registered yet, display
+                    // not in the map, plugin refused). The decoder already
+                    // skipped the software transfer for this frame, so the pixels
+                    // in `data` belong to an earlier frame -- pushing them would
+                    // flash the previous picture backwards. Drop this one and
+                    // make the refusal countable instead.
+                    count_gpu_frame_refused(display);
+                    gpu_refused_streak += 1;
+                    if gpu_refused_streak >= GPU_FRAME_REFUSE_LIMIT {
+                        // Self-heal instead of freezing: stop asking this
+                        // session's decoder for GPU frames, which puts it back on
+                        // the software path for the next frame with no restart.
+                        handler.disable_gpu_frames();
+                        gpu_refused_streak = 0;
+                    }
+                    return;
+                }
+                let _ = &pixelbuffer_output;
                 if pixelbuffer {
                     handler.on_rgba(display, data);
                 } else {
@@ -3321,5 +3355,35 @@ mod kept_cursor_tests {
         let mut bomb = compressed(4, 4);
         bomb.colors = hbb_common::compress::compress(&vec![0u8; 1 << 20]).into();
         assert!(kept_cursor_rgba(bomb).is_err(), "more pixels than its size");
+    }
+}
+
+/// How many decoded GPU frames the render path may refuse in a row before this
+/// session gives up on the direct path.
+///
+/// At 30-60 fps this is roughly one to two seconds. Long enough that the first
+/// frames of a session (the texture is registered after the first one arrives) do
+/// not trip it, short enough that a renderer that genuinely cannot present them
+/// is repaired inside the same second the picture would otherwise freeze.
+#[cfg(all(target_os = "macos", feature = "flutter", feature = "hwcodec"))]
+const GPU_FRAME_REFUSE_LIMIT: usize = 60;
+
+/// Count a decoded GPU frame that no UI session could present.
+///
+/// The decoder skips the software transfer for a frame it hands out, so when the
+/// render layer refuses one the pixels in the handler belong to an earlier frame:
+/// the frame is dropped instead of being replaced by stale pixels. The counter
+/// exists so a measurement can show the refusals are zero in normal operation,
+/// and the log stays quiet because it only prints on the first one and then every
+/// 100th.
+#[cfg(all(target_os = "macos", feature = "flutter", feature = "hwcodec"))]
+fn count_gpu_frame_refused(display: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+    let total = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if total == 1 || total % 100 == 0 {
+        log::warn!(
+            "display #{display}: decoded GPU frame refused by the render path ({total} so far), dropping it instead of pushing stale pixels"
+        );
     }
 }

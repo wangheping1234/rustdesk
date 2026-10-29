@@ -101,6 +101,10 @@ impl DerefMut for Encoder {
 }
 
 pub struct Decoder {
+    /// Per-session hand-off switch for decoded GPU frames; see
+    /// [`Self::set_gpu_frames_wanted`].
+    #[cfg(all(target_os = "macos", feature = "hwcodec"))]
+    gpu_frames_wanted: Option<crate::GpuFramesWanted>,
     vp8: Option<VpxDecoder>,
     vp9: Option<VpxDecoder>,
     av1: Option<AomDecoder>,
@@ -120,6 +124,10 @@ pub struct Decoder {
     valid: bool,
     #[cfg(feature = "hwcodec")]
     i420: Vec<u8>,
+    /// GPU frame produced by the last handle_video_frame call, if any.
+    /// Cross-platform slot: on targets without a GPU-frame path the type is
+    /// `Option<Infallible>`, so it is always `None` and costs nothing.
+    pixelbuffer: crate::PixelBufferOutput,
 }
 
 #[derive(Debug, Clone)]
@@ -498,6 +506,30 @@ impl Decoder {
         decoding
     }
 
+    /// Install the caller's "can the renderer present GPU frames" handle on every
+    /// hardware decoder this `Decoder` owns.
+    ///
+    /// The handle is per session, not per process: two sessions can render
+    /// differently, and a shared switch would make the software session's
+    /// decoder skip its software transfer. Decoders rebuilt later (a format
+    /// change) inherit it through the field it is stored in.
+    #[cfg(all(target_os = "macos", feature = "hwcodec"))]
+    pub fn set_gpu_frames_wanted(&mut self, wanted: crate::GpuFramesWanted) {
+        if let Some(d) = self.h264_ram.as_mut() {
+            d.set_pixelbuffer_wanted(wanted.clone());
+        }
+        if let Some(d) = self.h265_ram.as_mut() {
+            d.set_pixelbuffer_wanted(wanted.clone());
+        }
+        self.gpu_frames_wanted = Some(wanted);
+    }
+
+    /// The handle installed by [`Self::set_gpu_frames_wanted`], if any.
+    #[cfg(all(target_os = "macos", feature = "hwcodec"))]
+    pub fn gpu_frames_wanted_handle(&self) -> Option<crate::GpuFramesWanted> {
+        self.gpu_frames_wanted.clone()
+    }
+
     pub fn new(format: CodecFormat, _luid: Option<i64>) -> Decoder {
         log::info!("try create new decoder, format: {format:?}, _luid: {_luid:?}");
         let (mut vp8, mut vp9, mut av1) = (None, None, None);
@@ -597,6 +629,8 @@ impl Decoder {
             log::info!("create {format:?} decoder success");
         }
         Decoder {
+            #[cfg(all(target_os = "macos", feature = "hwcodec"))]
+            gpu_frames_wanted: None,
             vp8,
             vp9,
             av1,
@@ -616,7 +650,21 @@ impl Decoder {
             valid,
             #[cfg(feature = "hwcodec")]
             i420: vec![],
+            pixelbuffer: None,
         }
+    }
+
+    /// Take the GPU frame produced by the last `handle_video_frame` call.
+    ///
+    /// Taking clears the slot, so one frame is delivered at most once.
+    #[cfg(target_os = "macos")]
+    pub fn take_pixelbuffer(&mut self) -> crate::PixelBufferOutput {
+        self.pixelbuffer.take()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn take_pixelbuffer(&mut self) -> crate::PixelBufferOutput {
+        None
     }
 
     pub fn format(&self) -> CodecFormat {
@@ -668,7 +716,13 @@ impl Decoder {
                 }
                 #[cfg(feature = "hwcodec")]
                 if let Some(decoder) = &mut self.h264_ram {
-                    return Decoder::handle_hwram_video_frame(decoder, h264s, rgb, &mut self.i420);
+                    return Decoder::handle_hwram_video_frame(
+                        decoder,
+                        h264s,
+                        rgb,
+                        &mut self.i420,
+                        &mut self.pixelbuffer,
+                    );
                 }
                 Err(anyhow!("don't support h264!"))
             }
@@ -682,7 +736,13 @@ impl Decoder {
                 }
                 #[cfg(feature = "hwcodec")]
                 if let Some(decoder) = &mut self.h265_ram {
-                    return Decoder::handle_hwram_video_frame(decoder, h265s, rgb, &mut self.i420);
+                    return Decoder::handle_hwram_video_frame(
+                        decoder,
+                        h265s,
+                        rgb,
+                        &mut self.i420,
+                        &mut self.pixelbuffer,
+                    );
                 }
                 Err(anyhow!("don't support h265!"))
             }
@@ -769,12 +829,63 @@ impl Decoder {
         frames: &EncodedVideoFrames,
         rgb: &mut ImageRgb,
         i420: &mut Vec<u8>,
+        pixelbuffer: &mut crate::PixelBufferOutput,
     ) -> ResultType<bool> {
         let mut ret = false;
+        // Transaction boundary: the slot belongs to this batch of packets only,
+        // so a GPU frame from an earlier call can never be presented over a
+        // newer software frame (the `?` below can return in the middle of a
+        // batch, which used to leave the slot populated).
+        #[cfg(target_os = "macos")]
+        {
+            *pixelbuffer = None;
+        }
         for h264 in frames.frames.iter() {
-            for image in decoder.decode(&h264.data)? {
+            // Two forms, picked by whether this decoder may hand out a surface:
+            //
+            // * not requested (every non-macOS build, and any session that did
+            //   not opt in) -- decode straight into the images it returned, one
+            //   allocation, exactly the path that existed before.
+            // * requested -- the surface has to be taken while no borrow of the
+            //   decoder is alive, so decode first and then read the images back
+            //   through `last_frame_images`; the extra Vec buys the hand-off.
+            #[cfg(target_os = "macos")]
+            let gpu_wanted = decoder.pixelbuffer_wanted();
+            #[cfg(not(target_os = "macos"))]
+            let gpu_wanted = false;
+            if !gpu_wanted {
+                for image in decoder.decode(&h264.data)? {
+                    if image.to_fmt(rgb, i420).is_ok() {
+                        ret = true;
+                    }
+                }
+                continue;
+            }
+            #[cfg(target_os = "macos")]
+            decoder.decode(&h264.data)?;
+            // The GPU frame of this decode call, if the decoder delivered one.
+            #[cfg(target_os = "macos")]
+            if let Some(frame) = decoder.take_pixelbuffer() {
+                // Metadata only: the recorder sizes its output from `ImageRgb`,
+                // and the software conversion that used to fill these in never
+                // runs on this path, so a recording would otherwise open at 0x0
+                // (or at the last software frame's size). No pixels are copied.
+                rgb.w = frame.width() as usize;
+                rgb.h = frame.height() as usize;
+                *pixelbuffer = Some(frame);
+                ret = true;
+                continue;
+            }
+            for image in decoder.last_frame_images() {
                 // TODO: just process the last frame
                 if image.to_fmt(rgb, i420).is_ok() {
+                    // A software frame produced later in the same batch wins:
+                    // the rule is "the last decoded frame is the one presented",
+                    // and the caller must not paint an older GPU frame over it.
+                    #[cfg(target_os = "macos")]
+                    {
+                        *pixelbuffer = None;
+                    }
                     ret = true;
                 }
             }
