@@ -4,6 +4,15 @@ name: Build flutter-rust-bridge
 
 on:
   workflow_call:
+    inputs:
+      flutter_bridge_default_version:
+        description: "Default Flutter version to generate bridge with (like '3.22.3')"
+        type: string
+        required: true
+      flutter_bridge_arm64_version:
+        description: "Flutter version to generate ARM64 bridge with (like '3.44.9')"
+        type: string
+        required: true
 
 env:
   CARGO_EXPAND_VERSION: "1.0.95"
@@ -11,28 +20,46 @@ env:
   RUST_VERSION: "1.75" # https://github.com/rustdesk/rustdesk/discussions/7503
 
 jobs:
+  generate_bridge_matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      job: ${{ steps.define-matrix.outputs.job }}
+    env:
+      FLUTTER_BRIDGE_DEFAULT_VERSION: ${{ inputs.flutter_bridge_default_version }}
+      FLUTTER_BRIDGE_ARM64_VERSION: ${{ inputs.flutter_bridge_arm64_version }}
+    steps:
+      - name: Generate bridge matrix
+        id: define-matrix
+        shell: bash
+        run: |
+          MATRIX_JSON="[
+            {
+              \"desc\": \"Default bridge for every platform still on Flutter 3.24.5 (generated with 3.22.3).\",
+              \"target\": \"x86_64-unknown-linux-gnu\",
+              \"os\": \"ubuntu-22.04\",
+              \"extra-build-args\": \"\",
+              \"flutter-version\": \"${{ inputs.flutter_bridge_default_version }}\",
+              \"artifact-name\": \"bridge-artifact\"
+            },
+            {
+              \"desc\": \"Dedicated bridge for the Windows arm64 build (Flutter 3.44); runs in parallel.\",
+              \"target\": \"x86_64-unknown-linux-gnu\",
+              \"os\": \"ubuntu-22.04\",
+              \"extra-build-args\": \"\",
+              \"flutter-version\": \"${{ inputs.flutter_bridge_arm64_version }}\",
+              \"artifact-name\": \"bridge-artifact-flutter-3.44\"
+            }
+          ]"
+          MATRIX_JSON_COMPACT="$(echo "${MATRIX_JSON}" | jq -r 'tojson')"
+          echo "job=${MATRIX_JSON_COMPACT}" >> "${GITHUB_OUTPUT}"
+
   generate_bridge:
+    needs: [generate_bridge_matrix]
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
       matrix:
-        job:
-          # Default bridge for every platform still on Flutter 3.24.5 (generated with 3.22.3).
-          - {
-              target: x86_64-unknown-linux-gnu,
-              os: ubuntu-22.04,
-              extra-build-args: "",
-              flutter-version: "3.22.3",
-              artifact-name: "bridge-artifact",
-            }
-          # Dedicated bridge for the Windows arm64 build (Flutter 3.44); runs in parallel.
-          - {
-              target: x86_64-unknown-linux-gnu,
-              os: ubuntu-22.04,
-              extra-build-args: "",
-              flutter-version: "3.44.8",
-              artifact-name: "bridge-artifact-flutter-3.44",
-            }
+        job: ${{ fromJSON(needs.generate_bridge_matrix.outputs.job) }}
     steps:
       - name: Checkout source code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -85,18 +112,103 @@ jobs:
 
       - name: Install flutter rust bridge deps
         shell: bash
+        env:
+          FLUTTER_BRIDGE_VERSION: ${{ matrix.job.flutter-version }}
         run: |
-          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
-          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
-          if [[ "${{ matrix.job.flutter-version }}" == "3.22.3" ]]; then
+          cargo install cargo-expand --version "${CARGO_EXPAND_VERSION}" --locked
+          cargo install flutter_rust_bridge_codegen --version "${FLUTTER_RUST_BRIDGE_VERSION}" --features "uuid" --locked
+          case "${FLUTTER_BRIDGE_VERSION}" in
+          3.22.*)
             # Default Flutter 3.22.3: extended_text 14 needs a newer Dart, so downgrade for resolution.
             sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
-          else
+            ;;
+          3.44.*)
             # Flutter 3.44 bridge for Windows arm64: match that build's source/pubspec state so the
             # generated *.freezed.dart compiles against the same Flutter/freezed it resolves.
             bash .github/patches/apply_flutter_3.44_source_patches.sh
+            ;;
+          *)
+            # basilgello: Bail out as we dont know which version of flutter to use
+            # This requires devs to add the correct Flutter version into
+            # the matrix above and regenerate lockfile if it is not there yet
+            # or if it is outdated
+            echo "ERROR: Unknown Flutter version to build the bridge!"
+            echo ""
+            echo "Please see bridge.yml for instructions!"
+            echo ""
+            exit 1
+            ;;
+          esac
+          # Set proper bridge lockfile in place and try to get packages locked
+          BRIDGE_LOCKFILE_EXISTS=1
+          BRIDGE_LOCKFILE_DIFFERS=0
+          if [ -f "flutter/pubspec-bridge-${FLUTTER_BRIDGE_VERSION}.lock" ]; then
+            # basilgello: Copy bridge lockfile into pubspec.lock and let
+            # `flutter packages pub get` check it
+            cp "flutter/pubspec-bridge-${FLUTTER_BRIDGE_VERSION}.lock" "flutter/pubspec.lock"
+          else
+            BRIDGE_LOCKFILE_EXISTS=0
           fi
-          pushd flutter && flutter pub get && popd
+          pushd flutter
+          if ! flutter packages pub get --enforce-lockfile; then
+            # basilgello: re-generate lockfile and abort the workflow with error
+            # to signal the devs that pubspec-bridge.lock differs from the
+            # generated one
+            flutter packages pub get
+            if [ "${BRIDGE_LOCKFILE_EXISTS}" -eq 0 ]; then
+              echo "ERROR: Lockfile 'pubspec-bridge-${FLUTTER_BRIDGE_VERSION}.lock' does not exist!"
+              echo ""
+              echo "Maybe Flutter version used for bridge generation was bumped?"
+              echo ""
+              echo "If so, check the contents of file below and copy them"
+              echo "to 'pubspec-bridge-${FLUTTER_BRIDGE_VERSION}.lock'!"
+              echo ""
+            fi
+            if ! git diff --no-index --quiet --exit-code "pubspec.lock" "pubspec-bridge-${FLUTTER_BRIDGE_VERSION}.lock"; then
+              BRIDGE_LOCKFILE_DIFFERS=1
+
+              echo "ERROR: Lockfile 'pubspec-bridge-${FLUTTER_BRIDGE_VERSION}.lock' differs!"
+              echo ""
+              echo "Lockfile 'pubspec.lock' generated with 'pubspec.yaml'"
+              echo "patched for Flutter version ${FLUTTER_BRIDGE_VERSION}"
+              echo "differs from what we locked in the repository"
+              echo "(pubspec-bridge-${FLUTTER_BRIDGE_VERSION}.lock)"
+              echo ""
+              echo "Please verify manually if the new dependencies are OK"
+              echo "and copy the regenerated 'pubspec.lock' file into"
+              echo "'pubspec-bridge-${FLUTTER_BRIDGE_VERSION}.lock'"
+              echo "then commit and PR it!"
+              echo ""
+            fi
+            if [ "${BRIDGE_LOCKFILE_EXISTS}" -eq 0 ] || [ "${BRIDGE_LOCKFILE_DIFFERS}" -eq 1 ]; then
+              echo "Contents of pubspec.lock:"
+              echo "=========================="
+              cat pubspec.lock
+              echo "=========================="
+              echo ""
+
+              exit 1
+            fi
+          fi
+          # basilgello: Unfortunately, this protection is not enough to prevent hijack
+          # because `flutter build` calls another `dart pub get` under the hood and we
+          # can not pass `--enforce-lockfile` to `flutter build` to make it enforce the
+          # lockfile.
+          #
+          # We can not pass `--no-pub` to `flutter build` either because it also disables
+          # generation of flutter headers and causes weird CMake errors like
+          # `missing flutter_generated.cmake`.
+          #
+          # However, we can abuse the fact that `flutter build` skips unprotected `pub get`
+          # entirely if package lockfile (`.dart_tool/package_config.json`) was created by
+          # the generator other than `pub`.
+          #
+          # So we patch that file so `flutter build` skips unprotected package re-resolution.
+          if [ -f '.dart_tool/package_config.json' ]; then
+            sed -i -e 's/"pub"/"pubForced"/' '.dart_tool/package_config.json'
+            echo 'Successfully updated "generator" to "pubForced" in ".dart_tool/package_config.json"'
+          fi
+          popd
 
       - name: Run flutter rust bridge
         run: |

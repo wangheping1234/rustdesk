@@ -12,7 +12,17 @@
 #
 # Idempotent. To undo the source changes locally:
 #   git checkout -- flutter/lib/common.dart flutter/pubspec.yaml flutter/pubspec.lock
-set -euo pipefail
+set -eo pipefail
+
+# Bail out if FLUTTER_BRIDGE_VERSION env variable is not defined
+if [ -z "${FLUTTER_BRIDGE_VERSION}" ]; then
+  echo "ERROR: Missing environment variable FLUTTER_BRIDGE_VERSION!" >&2
+  echo '(like: export FLUTTER_BRIDGE_VERSION="3.44.8")' >&2
+  exit 1
+fi
+
+# Lockfile name for bridge builder
+BRIDGE_PUBSPEC_LOCKFILE_NAME="pubspec-bridge-${FLUTTER_BRIDGE_VERSION}.lock"
 
 flutter --version | grep -q "Flutter 3\.44\." || {
   echo "Flutter 3.44.x must be on PATH; found:" >&2
@@ -24,7 +34,48 @@ flutter --version | grep -q "Flutter 3\.44\." || {
 bash .github/patches/apply_flutter_3.44_source_patches.sh
 
 # Populate the pub cache with the 3.44 dependency resolution.
-(cd flutter && flutter pub get)
+pushd flutter
+if [ ! -f "${BRIDGE_PUBSPEC_LOCKFILE_NAME}" ]; then
+  echo "ERROR: Lockfile '${BRIDGE_PUBSPEC_LOCKFILE_NAME}' does not exist!"
+  echo ""
+  echo "Please run 'flutter packages pub get', review resulting 'pubspec.lock''"
+  echo "and copy it to '${BRIDGE_PUBSPEC_LOCKFILE_NAME}'"
+  echo "(or whatever Flutter version is used for this bridge!)"
+  echo ""
+
+  exit 1
+fi
+cp "${BRIDGE_PUBSPEC_LOCKFILE_NAME}" pubspec.lock
+if ! flutter packages pub get --enforce-lockfile; then
+  echo "ERROR: Lockfile '${BRIDGE_PUBSPEC_LOCKFILE_NAME}' needs to be updated!"
+  echo ""
+  echo "Please run 'flutter packages pub get', review resulting 'pubspec.lock''"
+  echo "and copy it to '${BRIDGE_PUBSPEC_LOCKFILE_NAME}'"
+  echo "(or whatever Flutter version is used for this bridge!)"
+  echo ""
+
+  exit 1
+fi
+
+# basilgello: Unfortunately, this protection is not enough to prevent hijack
+# because `flutter build` calls another `dart pub get` under the hood and we
+# can not pass `--enforce-lockfile` to `flutter build` to make it enforce the
+# lockfile.
+#
+# We can not pass `--no-pub` to `flutter build` either because it also disables
+# generation of flutter headers and causes weird CMake errors like
+# `missing flutter_generated.cmake`.
+#
+# However, we can abuse the fact that `flutter build` skips unprotected `pub get`
+# entirely if package lockfile (`.dart_tool/package_config.json`) was created by
+# the generator other than `pub`.
+#
+# So we patch that file so `flutter build` skips unprotected package re-resolution.
+if [ -f '.dart_tool/package_config.json' ]; then
+  sed -i -e 's/"pub"/"pubForced"/' '.dart_tool/package_config.json'
+  echo 'Successfully updated "generator" to "pubForced" in ".dart_tool/package_config.json"'
+fi
+popd
 
 # qr_code_scanner 1.0.1 (unmaintained) reads platformViewRegistry from
 # dart:ui, which Flutter 3.44 removed; point it at dart:ui_web instead. The
